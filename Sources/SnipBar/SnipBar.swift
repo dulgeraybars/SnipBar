@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import ScreenCaptureKit
 import ServiceManagement
 import os
 
@@ -13,6 +14,8 @@ private func NSLog(_ format: String, _ args: CVarArg...) {
 /// Set by the app delegate; invoked on the main thread when Control+Option+S is pressed.
 private var hotKeyAction: (() -> Void)?
 
+private func frontAppName() -> String { NSWorkspace.shared.frontmostApplication?.localizedName ?? "?" }
+
 @main
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
@@ -22,6 +25,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotKeyRef: EventHotKeyRef?
     private var hotKeyRegistered = false
     private var capturing = false  // main-thread only
+    private let freezer = ScreenFreezer()
+    private var selection: SelectionController?
+    private var freezePending = false
+    #if SNIPBAR_TEST
+    private var testInvisibleOverlay = false
+    #endif
+    private var invisibleOverlay: Bool {
+        #if SNIPBAR_TEST
+        return testInvisibleOverlay
+        #else
+        return false
+        #endif
+    }
     private var permissionRequested = false
     private var editor: EditorController?
     private var rightClickMonitor: Any?
@@ -60,7 +76,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        #if SNIPBAR_TEST
+        // A test copy shares this app's preferences, and the system stores a status item's visibility there
+        // under its autosave name: a test copy must use its own name before it hides its icon.
+        let isTestRun = CommandLine.arguments.contains(where: { $0.hasPrefix("--test-") })
+        statusItem.autosaveName = isTestRun ? "SnipBarTestStatusItem" : "SnipBarStatusItem"
+        if isTestRun { statusItem.isVisible = false }
+        #else
         statusItem.autosaveName = "SnipBarStatusItem"  // remembers a position chosen by Command-dragging
+        #endif
         if let button = statusItem.button {
             let image = NSImage(systemSymbolName: "scissors", accessibilityDescription: "SnipBar")
             image?.isTemplate = true
@@ -83,6 +107,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async { self.showMenu() }
             return nil
         }
+        freezer.prepare()
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                               object: nil, queue: .main) { [weak self] _ in self?.freezer.prepare() }
         NSLog("SnipBar launched, screenRecordingPermission=%d", CGPreflightScreenCaptureAccess() ? 1 : 0)
         DispatchQueue.main.async { [weak self] in self?.logStatusItem() }  // once the window has settled
 
@@ -163,6 +190,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
+        if let i = args.firstIndex(of: "--test-capture-ui"), args.count > i + 2,
+           let delay = Double(args[i + 1]), let hold = Double(args[i + 2]) {
+            // Starts the system selection UI like the hotkey does, holds it open, then ends it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                NSLog("SnipBar TEST capture-ui start")
+                self?.capture()
+                DispatchQueue.main.asyncAfter(deadline: .now() + hold) { [weak self] in
+                    NSLog("SnipBar TEST capture-ui end")
+                    if let t = self?.nativeTask, t.isRunning { t.terminate() }
+                    NSApp.terminate(nil)
+                }
+            }
+        }
+        if args.contains("--test-select") { runSelectTest() }
+        if args.contains("--test-freeze") { runFreezeTest() }
+        if args.contains("--test-flow") { runFlowTest() }
         if let i = args.firstIndex(of: "--test-band"), args.count > i + 1, let r = parse(args[i + 1]) {
             band = RubberBand()
             band?.show(r)
@@ -239,13 +282,227 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSLog("SnipBar TEST editor DONE failures=%ld", failures)
         NSApp.terminate(nil)
     }
+
+    private func waitUntil(_ timeout: Double, _ cond: @escaping () -> Bool, _ then: @escaping (Bool) -> Void) {
+        let end = Date().addingTimeInterval(timeout)
+        func tick() {
+            if cond() { then(true) } else if Date() > end { then(false) } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: tick)
+            }
+        }
+        tick()
+    }
+
+    /// Selection logic on a synthetic picture (four coloured quadrants), with invisible panels.
+    private func runSelectTest() {
+        var failures = 0
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            NSLog("SnipBar TEST select %@ %@ %@", ok ? "PASS" : "FAIL", name, detail)
+            if !ok { failures += 1 }
+        }
+        let w = 600, h = 300
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue), let screen = NSScreen.main else { return }
+        func fill(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, _ rect: CGRect) {
+            ctx.setFillColor(CGColor(srgbRed: r, green: g, blue: b, alpha: 1))
+            ctx.fill(rect)
+        }
+        // CGContext origin is bottom-left; the finished image's first row is the top.
+        fill(1, 0, 0, CGRect(x: 0, y: h / 2, width: w / 2, height: h / 2))      // top-left red
+        fill(0, 1, 0, CGRect(x: w / 2, y: h / 2, width: w / 2, height: h / 2))  // top-right green
+        fill(0, 0, 1, CGRect(x: 0, y: 0, width: w / 2, height: h / 2))          // bottom-left blue
+        fill(1, 1, 0, CGRect(x: w / 2, y: 0, width: w / 2, height: h / 2))      // bottom-right yellow
+        guard let image = ctx.makeImage() else { return }
+        let view = screen.frame.size
+        let sx = CGFloat(w) / view.width, sy = CGFloat(h) / view.height
+        func px(_ rep: NSBitmapImageRep, _ x: Int, _ y: Int) -> (Int, Int, Int) {
+            var v = [Int](repeating: 0, count: 5)
+            rep.getPixel(&v, atX: x, y: y)
+            return (v[0], v[1], v[2])
+        }
+        func run(_ body: (SelectionController) -> Void) -> (result: (CGImage, Bool)?, cancelled: Bool) {
+            let c = SelectionController(frames: [ScreenFreezer.Frame(screen: screen, image: image)], invisible: true)
+            var res: (CGImage, Bool)?
+            var cancelled = false
+            c.onSelect = { res = ($0, $1) }
+            c.onCancel = { cancelled = true }
+            body(c)
+            return (res, cancelled)
+        }
+
+        // 1. left drag inside the top-left quadrant
+        var r = run { $0.testView?.testDrag(from: CGPoint(x: 100, y: 600), to: CGPoint(x: 700, y: 900), right: false) }
+        if let (img, right) = r.result {
+            let rep = NSBitmapImageRep(cgImage: img)
+            let c = px(rep, rep.pixelsWide / 2, rep.pixelsHigh / 2)
+            check("left drag: not the editor", !right)
+            check("left drag: crop size follows the drag", abs(img.width - Int(600 * sx)) <= 2 && abs(img.height - Int(300 * sy)) <= 2, "\(img.width)x\(img.height) expected ~\(Int(600 * sx))x\(Int(300 * sy))")
+            check("left drag: crop is from the top-left quadrant (red)", c.0 > 240 && c.1 < 15 && c.2 < 15, "\(c)")
+        } else { check("left drag: a result", false) }
+
+        // 2. right drag across the centre: all four colours, in the right places
+        r = run { $0.testView?.testDrag(from: CGPoint(x: 500, y: 300), to: CGPoint(x: 1000, y: 700), right: true) }
+        if let (img, right) = r.result {
+            let rep = NSBitmapImageRep(cgImage: img)
+            let tl = px(rep, 2, 2), tr = px(rep, img.width - 3, 2), bl = px(rep, 2, img.height - 3), br = px(rep, img.width - 3, img.height - 3)
+            check("right drag: opens the editor", right)
+            check("right drag: top-left red", tl.0 > 240 && tl.1 < 15 && tl.2 < 15, "\(tl)")
+            check("right drag: top-right green", tr.1 > 240 && tr.0 < 15 && tr.2 < 15, "\(tr)")
+            check("right drag: bottom-left blue", bl.2 > 240 && bl.0 < 15 && bl.1 < 15, "\(bl)")
+            check("right drag: bottom-right yellow", br.0 > 240 && br.1 > 240 && br.2 < 15, "\(br)")
+        } else { check("right drag: a result", false) }
+
+        // 3. things that must select nothing
+        r = run { $0.testView?.testDrag(from: CGPoint(x: 300, y: 300), to: CGPoint(x: 303, y: 303), right: false) }
+        check("a 3 pt drag selects nothing", r.result == nil && !r.cancelled)
+        r = run { $0.testView?.testDrag(from: CGPoint(x: 300, y: 300), to: CGPoint(x: 300, y: 300), right: true) }
+        check("a plain click selects nothing", r.result == nil && !r.cancelled)
+        r = run { c in
+            c.testView?.begin(at: CGPoint(x: 100, y: 100), right: false)
+            c.testView?.move(to: CGPoint(x: 400, y: 400))
+            c.testView?.end(at: CGPoint(x: 400, y: 400), right: true)  // the other button went up: ignored
+        }
+        check("releasing the other button does not finish the selection", r.result == nil)
+        r = run { c in
+            c.testView?.begin(at: CGPoint(x: 100, y: 100), right: false)
+            c.testView?.begin(at: CGPoint(x: 900, y: 900), right: true)  // a second button during the drag: ignored
+            c.testView?.end(at: CGPoint(x: 400, y: 400), right: false)
+        }
+        if let (img, right) = r.result {
+            check("a second button during the drag is ignored", !right && abs(img.width - Int(300 * sx)) <= 2, "\(img.width)x\(img.height)")
+        } else { check("a second button during the drag is ignored", false, "no result") }
+
+        // 4. Esc
+        r = run { $0.testEscape() }
+        check("Esc cancels", r.result == nil && r.cancelled)
+
+        // 5. a selection at the far edge stays inside the picture
+        r = run { $0.testView?.testDrag(from: CGPoint(x: view.width - 100, y: 10), to: CGPoint(x: view.width, y: 100), right: false) }
+        if let (img, _) = r.result {
+            let rep = NSBitmapImageRep(cgImage: img)
+            let c = px(rep, rep.pixelsWide / 2, rep.pixelsHigh / 2)
+            check("edge selection: yellow corner, inside the picture", c.0 > 240 && c.1 > 240 && c.2 < 15 && img.width <= Int(100 * sx) + 2, "\(img.width)x\(img.height) \(c)")
+        } else { check("edge selection: a result", false) }
+
+        NSLog("SnipBar TEST select DONE failures=%ld", failures)
+        NSApp.terminate(nil)
+    }
+
+    /// How fast the freeze is, warm and after a pause.
+    private func runFreezeTest() {
+        freezer.prepare()
+        waitUntil(3, { self.freezer.isReady }) { ready in
+            guard ready else { NSLog("SnipBar TEST freeze FAIL not prepared"); NSApp.terminate(nil); return }
+            var times: [String] = []
+            func one(_ label: String, _ next: @escaping () -> Void) {
+                let t = DispatchTime.now()
+                self.freezer.freeze { frames in
+                    if let f = frames?.first {
+                        times.append(String(format: "%@=%.0fms(%dx%d)", label, msSince(t), f.image.width, f.image.height))
+                    } else { times.append("\(label)=FAILED") }
+                    next()
+                }
+            }
+            func warm(_ i: Int) {
+                guard i < 6 else {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                        one("after12sIdle") {
+                            NSLog("SnipBar TEST freeze latency: %@", times.joined(separator: " "))
+                            NSApp.terminate(nil)
+                        }
+                    }
+                    return
+                }
+                one("run\(i)") { DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { warm(i + 1) } }
+            }
+            warm(0)
+        }
+    }
+
+    /// The real freeze (ScreenCaptureKit) with invisible panels, driven by simulated drags: left copies,
+    /// right opens the editor and copies nothing, Esc leaves the clipboard alone.
+    private func runFlowTest() {
+        let pb = NSPasteboard.general
+        var failures = 0
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            NSLog("SnipBar TEST flow %@ %@ %@", ok ? "PASS" : "FAIL", name, detail)
+            if !ok { failures += 1 }
+        }
+        func spread(_ rep: NSBitmapImageRep) -> Double {  // standard deviation over a sample: a real picture is not flat
+            var sum = 0.0, sumSq = 0.0, n = 0.0
+            for yy in stride(from: 0, to: rep.pixelsHigh, by: max(rep.pixelsHigh / 20, 1)) {
+                for xx in stride(from: 0, to: rep.pixelsWide, by: max(rep.pixelsWide / 20, 1)) {
+                    var v = [Int](repeating: 0, count: 5)
+                    rep.getPixel(&v, atX: xx, y: yy)
+                    let g = Double(v[0] + v[1] + v[2]) / 3
+                    sum += g; sumSq += g * g; n += 1
+                }
+            }
+            let mean = sum / n
+            return max(sumSq / n - mean * mean, 0).squareRoot()
+        }
+        testInvisibleOverlay = true
+        freezer.prepare()
+        waitUntil(3, { self.freezer.isReady }) { ready in
+            check("the freezer is prepared", ready)
+            guard ready else { NSApp.terminate(nil); return }
+            pb.clearContents()
+            pb.setString("previous clipboard content", forType: .string)
+            let seeded = pb.changeCount
+            let scale = NSScreen.main?.backingScaleFactor ?? 2
+
+            // 1. left drag copies
+            let t0 = DispatchTime.now()
+            self.capture()
+            self.waitUntil(3, { self.selection != nil }) { shown in
+                check("the selection is shown after the freeze", shown, String(format: "%.0f ms after the trigger", msSince(t0)))
+                guard shown, let view = self.selection?.testView else { NSApp.terminate(nil); return }
+                view.testDrag(from: CGPoint(x: 300, y: 300), to: CGPoint(x: 700, y: 600), right: false)
+                check("left drag: clipboard written exactly once", pb.changeCount == seeded + 1, "changeCount \(seeded) -> \(pb.changeCount)")
+                if let rep = pb.data(forType: .png).flatMap({ NSBitmapImageRep(data: $0) }) {
+                    check("left drag: size is the dragged area times the scale",
+                          abs(rep.pixelsWide - Int(400 * scale)) <= 2 && abs(rep.pixelsHigh - Int(300 * scale)) <= 2,
+                          "\(rep.pixelsWide)x\(rep.pixelsHigh) expected \(Int(400 * scale))x\(Int(300 * scale))")
+                    let sd = spread(rep)
+                    check("left drag: the picture is real screen content, not blank", sd > 5, String(format: "spread %.1f", sd))
+                } else { check("left drag: clipboard has an image", false) }
+                check("left drag: capture is finished", !self.capturing && self.selection == nil)
+                let afterLeft = pb.changeCount
+
+                // 2. right drag opens the editor and copies nothing
+                self.capture()
+                self.waitUntil(3, { self.selection != nil }) { shown2 in
+                    guard shown2, let view2 = self.selection?.testView else { check("second selection shown", false); NSApp.terminate(nil); return }
+                    view2.testDrag(from: CGPoint(x: 300, y: 300), to: CGPoint(x: 700, y: 600), right: true)
+                    check("right drag: nothing copied", pb.changeCount == afterLeft, "changeCount \(afterLeft) -> \(pb.changeCount)")
+                    check("right drag: editor opened", self.editor != nil)
+                    self.editor?.close(reason: "test")
+
+                    // 3. Esc leaves the clipboard alone
+                    self.capture()
+                    self.waitUntil(3, { self.selection != nil }) { shown3 in
+                        guard shown3 else { check("third selection shown", false); NSApp.terminate(nil); return }
+                        self.selection?.testEscape()
+                        check("Esc: capture ended", !self.capturing && self.selection == nil)
+                        check("Esc: clipboard untouched", pb.changeCount == afterLeft, "changeCount \(afterLeft) -> \(pb.changeCount)")
+                        NSLog("SnipBar TEST flow DONE failures=%ld", failures)
+                        NSApp.terminate(nil)
+                    }
+                }
+            }
+        }
+    }
     #endif
 
     // MARK: Hotkey, menu, login item, diagnostics
 
     /// Control+Option+S via Carbon: needs no Accessibility / Input Monitoring permission.
     private func registerHotKey() {
-        hotKeyAction = { [weak self] in self?.capture() }
+        hotKeyAction = { [weak self] in
+            self?.capture()  // first: the picture must not wait for anything
+            NSLog("SnipBar hotkey pressed front=%@", frontAppName())
+        }
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         let installStatus = InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
             DispatchQueue.main.async { hotKeyAction?() }
@@ -310,11 +567,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             || event.type == .rightMouseUp {
             showMenu()
         } else {
-            capture()
+            capture()  // first: the picture must not wait for anything
+            NSLog("SnipBar icon click front=%@", frontAppName())
         }
     }
 
+    /// Start of every capture (icon, hotkey, menu). The picture is taken FIRST and nothing may delay it:
+    /// an app that hides its window when the menu bar icon takes its focus (it fades out over some tens of
+    /// milliseconds) is still on screen right after the click. The selection then happens on that frozen picture.
     private func capture() {
+        guard !capturing else { return }
+        guard freezer.isReady, CGPreflightScreenCaptureAccess() else {
+            captureWithSystemSelector()  // not prepared yet, or no permission: the old path handles both
+            return
+        }
+        editor?.close(reason: "new capture")  // only one editor at a time; closing also clears it
+        capturing = true
+        freezePending = true
+        let started = DispatchTime.now()
+        freezer.freeze { [weak self] frames in
+            guard let self, self.freezePending else { return }  // the watchdog below may have taken over
+            self.freezePending = false
+            guard let frames else {
+                NSLog("SnipBar freeze failed, using the system selector")
+                self.capturing = false
+                self.captureWithSystemSelector()
+                return
+            }
+            NSLog("SnipBar freeze: %ld frame(s) in %.0f ms", frames.count, msSince(started))
+            self.beginSelection(frames)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, self.freezePending else { return }
+            self.freezePending = false
+            NSLog("SnipBar freeze timed out, using the system selector")
+            self.capturing = false
+            self.captureWithSystemSelector()
+        }
+    }
+
+    private func beginSelection(_ frames: [ScreenFreezer.Frame]) {
+        let controller = SelectionController(frames: frames, invisible: invisibleOverlay)
+        controller.onSelect = { [weak self] image, edit in self?.selectionFinished(image: image, edit: edit) }
+        controller.onCancel = { [weak self] in self?.selectionEnded(reason: "cancelled") }
+        selection = controller
+        controller.show()
+    }
+
+    private func selectionEnded(reason: String) {
+        selection = nil
+        capturing = false
+        freezer.prepare()  // keeps the prepared displays and filters fresh
+        NSLog("SnipBar selection ended (%@)", reason)
+    }
+
+    /// Left button: copy to the clipboard. Right button: open the editor (nothing is copied until Bitti).
+    private func selectionFinished(image: CGImage, edit: Bool) {
+        selectionEnded(reason: edit ? "right button, editor" : "left button, copy")
+        let rep = NSBitmapImageRep(cgImage: image)
+        guard let png = rep.representation(using: .png, properties: [:]) else {
+            showError("Seçilen alan PNG'ye çevrilemedi.", offerSettings: false)
+            return
+        }
+        if edit {
+            openEditor(image: image, originalPNG: png, clipboardHasImage: false)
+        } else {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setData(png, forType: .png)
+            if let tiff = rep.tiffRepresentation { pb.setData(tiff, forType: .tiff) }
+            NSLog("SnipBar copied selection %dx%d bytes=%ld changeCount=%ld", image.width, image.height, png.count, pb.changeCount)
+        }
+    }
+
+    /// The previous way, kept as the fallback: the system's own selection UI (`screencapture -i`).
+    private func captureWithSystemSelector() {
         guard !capturing else { return }
         editor?.close(reason: "new capture")  // only one editor at a time; closing also clears it
         // Without Screen Recording permission screencapture shows the selection UI
@@ -352,6 +679,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do {
             try task.run()
             nativeTask = task
+            NSLog("SnipBar capture start front=%@", frontAppName())
             startWatchingMouseButtons()
         } catch {
             capturing = false
@@ -420,9 +748,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let countAfter = pasteboard.changeCount
         let hasImage = pasteboard.availableType(from: [.png, .tiff]) != nil
         let copied = countAfter != countBefore && hasImage
-        NSLog("SnipBar capture done: exit=%d duration=%.2fs changeCount %ld->%ld image=%d rightDrag=%d stderr=\"%@\"",
+        NSLog("SnipBar capture done: exit=%d duration=%.2fs changeCount %ld->%ld image=%d rightDrag=%d front=%@ stderr=\"%@\"",
               status, Date().timeIntervalSince(started), countBefore, countAfter, hasImage ? 1 : 0,
-              (rect != nil || rightHeld) ? 1 : 0, stderr)
+              (rect != nil || rightHeld) ? 1 : 0, frontAppName(), stderr)
 
         if copied {
             capturing = false
@@ -503,6 +831,279 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if offerSettings { alert.addButton(withTitle: "Sistem Ayarları'nı Aç") }
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertSecondButtonReturn { openScreenRecordingSettings() }
+    }
+}
+
+// MARK: - Freeze the screen, select on the frozen picture
+
+private func msSince(_ t: DispatchTime) -> Double { Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1e6 }
+
+/// Takes the picture the selection works on as soon as possible after the trigger. The displays and the
+/// capture filters are prepared in advance, so a trigger only has to call captureImage (about 20-40 ms).
+private final class ScreenFreezer {
+    struct Frame {
+        let screen: NSScreen
+        let image: CGImage  // pixels, origin top-left
+    }
+    private struct Prepared {
+        let displayID: CGDirectDisplayID
+        let filter: SCContentFilter
+        let config: SCStreamConfiguration
+    }
+    private var prepared: [Prepared] = []  // main thread only
+    var isReady: Bool { !prepared.isEmpty }
+
+    private static func displayID(of screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+    }
+
+    func prepare() {
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] content, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard let content else {
+                    NSLog("SnipBar freeze: could not prepare: %@", error.map { String(describing: $0) } ?? "no content")
+                    return
+                }
+                var list: [Prepared] = []
+                for display in content.displays {
+                    guard let screen = NSScreen.screens.first(where: { Self.displayID(of: $0) == display.displayID }) else { continue }
+                    let config = SCStreamConfiguration()
+                    config.width = Int((screen.frame.width * screen.backingScaleFactor).rounded())
+                    config.height = Int((screen.frame.height * screen.backingScaleFactor).rounded())
+                    config.showsCursor = false
+                    config.pixelFormat = kCVPixelFormatType_32BGRA
+                    list.append(Prepared(displayID: display.displayID,
+                                         filter: SCContentFilter(display: display, excludingWindows: []), config: config))
+                }
+                self.prepared = list
+            }
+        }
+    }
+
+    /// Calls `completion` on the main queue with one frame per display, or nil if any capture failed.
+    func freeze(completion: @escaping ([Frame]?) -> Void) {
+        let items = prepared
+        guard !items.isEmpty else { completion(nil); return }
+        let box = FrameBox()
+        let group = DispatchGroup()
+        for item in items {
+            group.enter()
+            SCScreenshotManager.captureImage(contentFilter: item.filter, configuration: item.config) { image, error in
+                if let image {
+                    box.set(image, for: item.displayID)
+                } else {
+                    NSLog("SnipBar freeze: capture failed: %@", error.map { String(describing: $0) } ?? "no image")
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            var frames: [Frame] = []
+            for item in items {
+                guard let image = box.image(for: item.displayID),
+                      let screen = NSScreen.screens.first(where: { Self.displayID(of: $0) == item.displayID }) else {
+                    completion(nil)
+                    return
+                }
+                frames.append(Frame(screen: screen, image: image))
+            }
+            completion(frames)
+        }
+    }
+}
+
+private final class FrameBox: @unchecked Sendable {
+    private var images: [CGDirectDisplayID: CGImage] = [:]
+    private let lock = NSLock()
+    func set(_ image: CGImage, for id: CGDirectDisplayID) { lock.lock(); images[id] = image; lock.unlock() }
+    func image(for id: CGDirectDisplayID) -> CGImage? { lock.lock(); defer { lock.unlock() }; return images[id] }
+}
+
+/// Crops `image` (pixels, origin top-left) to `viewRect` (points, origin bottom-left) of a view of `viewSize`.
+func cropFrozen(_ image: CGImage, viewRect: CGRect, viewSize: CGSize) -> CGImage? {
+    guard viewSize.width > 0, viewSize.height > 0 else { return nil }
+    let sx = CGFloat(image.width) / viewSize.width
+    let sy = CGFloat(image.height) / viewSize.height
+    let pixels = CGRect(x: viewRect.minX * sx, y: (viewSize.height - viewRect.maxY) * sy,
+                        width: viewRect.width * sx, height: viewRect.height * sy).integral
+    return image.cropping(to: pixels.intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height)))
+}
+
+/// Full-screen panel that shows the frozen picture of one display. It becomes key without activating
+/// SnipBar (so the Esc key reaches it, and the app that was in front stays the active app).
+private final class SelectionPanel: NSPanel {
+    var onEscape: (() -> Void)?
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+    override func keyDown(with event: NSEvent) { if event.keyCode == 53 { onEscape?() } }
+    override func cancelOperation(_ sender: Any?) { onEscape?() }
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }  // may cover the menu bar
+}
+
+private final class SelectionView: NSView {
+    private let image: CGImage
+    var onSelect: ((CGImage, Bool) -> Void)?
+    private let dim = CAShapeLayer()
+    private let border = CAShapeLayer()
+    private let label = CATextLayer()
+    private var start: CGPoint?
+    private var rightButton = false
+
+    init(frame: NSRect, image: CGImage, scale: CGFloat) {
+        self.image = image
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.contents = image
+        layer?.contentsGravity = .resize
+        layer?.contentsScale = scale
+        dim.fillColor = NSColor.black.withAlphaComponent(0.4).cgColor
+        dim.fillRule = .evenOdd
+        border.fillColor = nil
+        border.strokeColor = NSColor.white.cgColor
+        border.lineWidth = 1.5
+        label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        label.fontSize = 12
+        label.alignmentMode = .center
+        label.foregroundColor = NSColor.white.cgColor
+        label.backgroundColor = NSColor.black.withAlphaComponent(0.65).cgColor
+        label.cornerRadius = 4
+        label.contentsScale = scale
+        for l in [dim, border, label] {
+            l.isHidden = true
+            layer?.addSublayer(l)
+        }
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.cursorUpdate, .mouseMoved, .activeAlways, .inVisibleRect], owner: self))
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func cursorUpdate(with event: NSEvent) { NSCursor.crosshair.set() }
+    override func mouseMoved(with event: NSEvent) { NSCursor.crosshair.set() }
+
+    private func point(_ e: NSEvent) -> CGPoint {
+        let p = convert(e.locationInWindow, from: nil)
+        return CGPoint(x: min(max(p.x, 0), bounds.width), y: min(max(p.y, 0), bounds.height))
+    }
+    override func mouseDown(with e: NSEvent) { begin(at: point(e), right: false) }
+    override func rightMouseDown(with e: NSEvent) { begin(at: point(e), right: true) }
+    override func mouseDragged(with e: NSEvent) { move(to: point(e)) }
+    override func rightMouseDragged(with e: NSEvent) { move(to: point(e)) }
+    override func mouseUp(with e: NSEvent) { end(at: point(e), right: false) }
+    override func rightMouseUp(with e: NSEvent) { end(at: point(e), right: true) }
+
+    // The selection logic is separate from the events so that tests can drive it.
+    func begin(at p: CGPoint, right: Bool) {
+        guard start == nil else { return }  // the first button that went down owns the selection
+        start = p
+        rightButton = right
+    }
+    func move(to p: CGPoint) {
+        guard let s = start else { return }
+        show(rectBetween(s, p))
+    }
+    func end(at p: CGPoint, right: Bool) {
+        guard let s = start, right == rightButton else { return }
+        start = nil
+        let r = rectBetween(s, p)
+        hideSelection()
+        guard r.width >= 4, r.height >= 4,  // a plain click selects nothing
+              let cropped = cropFrozen(image, viewRect: r, viewSize: bounds.size) else { return }
+        onSelect?(cropped, right)
+    }
+    func testDrag(from a: CGPoint, to b: CGPoint, right: Bool) {
+        begin(at: a, right: right)
+        move(to: b)
+        end(at: b, right: right)
+    }
+
+    private func show(_ r: CGRect) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let path = CGMutablePath()
+        path.addRect(bounds)
+        path.addRect(r)
+        dim.frame = bounds
+        dim.path = path
+        border.frame = bounds
+        border.path = CGPath(rect: r, transform: nil)
+        let w = Int((r.width * CGFloat(image.width) / bounds.width).rounded())
+        let h = Int((r.height * CGFloat(image.height) / bounds.height).rounded())
+        let text = "\(w) × \(h)"
+        let textW = (text as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .medium)]).width + 14
+        var ly = r.maxY + 6
+        if ly + 16 > bounds.height { ly = r.maxY - 22 }
+        label.string = text
+        label.frame = CGRect(x: min(max(r.minX, 0), bounds.width - textW), y: ly, width: textW, height: 16)
+        for l in [dim, border, label] { l.isHidden = false }
+        CATransaction.commit()
+    }
+
+    private func hideSelection() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for l in [dim, border, label] { l.isHidden = true }
+        CATransaction.commit()
+    }
+}
+
+private final class SelectionController {
+    private var panels: [(panel: SelectionPanel, view: SelectionView)] = []
+    var onSelect: ((CGImage, Bool) -> Void)?
+    var onCancel: (() -> Void)?
+    private var finished = false
+    private let invisible: Bool
+
+    /// `invisible` is for tests: the panels exist but show nothing and take no mouse events or key focus.
+    init(frames: [ScreenFreezer.Frame], invisible: Bool = false) {
+        self.invisible = invisible
+        for f in frames {
+            let panel = SelectionPanel(contentRect: f.screen.frame, styleMask: [.borderless, .nonactivatingPanel],
+                                       backing: .buffered, defer: false)
+            panel.setFrame(f.screen.frame, display: false)
+            panel.level = .screenSaver
+            panel.isOpaque = true
+            panel.backgroundColor = .black
+            panel.hasShadow = false
+            panel.animationBehavior = .none  // it must appear at once, not fade in
+            panel.isReleasedWhenClosed = false
+            panel.hidesOnDeactivate = false
+            panel.acceptsMouseMovedEvents = true
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+            let view = SelectionView(frame: NSRect(origin: .zero, size: f.screen.frame.size), image: f.image,
+                                     scale: f.screen.backingScaleFactor)
+            view.onSelect = { [weak self] image, right in self?.finish((image, right)) }
+            panel.onEscape = { [weak self] in self?.finish(nil) }
+            panel.contentView = view
+            if invisible {
+                panel.alphaValue = 0
+                panel.ignoresMouseEvents = true
+            }
+            panels.append((panel, view))
+        }
+    }
+
+    var testView: SelectionView? { panels.first?.view }
+    func testEscape() { panels.first?.panel.onEscape?() }
+
+    func show() {
+        for p in panels { p.panel.orderFrontRegardless() }
+        guard !invisible else { return }
+        let mouse = NSEvent.mouseLocation
+        (panels.first { NSMouseInRect(mouse, $0.panel.frame, false) } ?? panels.first)?.panel.makeKey()
+        NSCursor.crosshair.set()
+    }
+
+    private func finish(_ result: (CGImage, Bool)?) {
+        guard !finished else { return }
+        finished = true
+        for p in panels {
+            p.panel.orderOut(nil)
+            p.panel.close()
+        }
+        panels = []
+        if let result { onSelect?(result.0, result.1) } else { onCancel?() }
     }
 }
 
